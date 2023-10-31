@@ -1,3 +1,5 @@
+use std::io::{Cursor, Read};
+
 use anyhow::{Ok, Result};
 use num_enum::TryFromPrimitive;
 use rand::Rng;
@@ -11,6 +13,13 @@ mod macros {
             <$ty>::from_be_bytes($buf[$range].try_into()?)
         };
     }
+}
+
+mod consts {
+    pub const DNS_BUF_SIZE: usize = 1024;
+    pub const HEADER_SIZE: usize = 12;
+    pub const QUESTION_DATA_SIZE: usize = 4;
+    pub const RECORD_DATA_SIZE: usize = 10;
 }
 
 trait ToBytes {
@@ -56,6 +65,14 @@ impl TryFrom<&[u8]> for DnsHeader {
     }
 }
 
+fn parse_header<const SIZE: usize>(reader: &mut Cursor<&[u8; SIZE]>) -> Result<DnsHeader> {
+    let header = &mut [0; consts::HEADER_SIZE];
+    reader.read_exact(header)?;
+    let header: &[u8] = header;
+    DnsHeader::try_from(header)
+}
+
+#[derive(Debug)]
 struct DnsQuestion {
     pub name: Vec<u8>,
     pub kind: RecordType,
@@ -83,6 +100,47 @@ impl TryFrom<(Vec<u8>, &[u8])> for DnsQuestion {
             class: Class::try_from(extract_bytes!(data, 2..4, u16))?,
         })
     }
+}
+
+fn parse_question<const SIZE: usize>(reader: &mut Cursor<&[u8; SIZE]>) -> Result<DnsQuestion> {
+    let name = decord_name(reader)?;
+    let data = &mut [0; consts::QUESTION_DATA_SIZE];
+    reader.read_exact(data)?;
+    let data: &[u8] = data;
+    DnsQuestion::try_from((name.into(), data))
+}
+
+fn decord_name<const SIZE: usize>(reader: &mut Cursor<&[u8; SIZE]>) -> Result<String> {
+    let mut cursor = reader.position();
+    let mut parts = Vec::new();
+    let mut length = reader.get_ref()[cursor as usize];
+
+    while length != 0 {
+        if (length & 0b1100_0000) != 0 {
+            parts.push(decord_compressed_name(reader)?);
+            cursor += 2;
+            reader.set_position(cursor);
+            return Ok(parts.join("."));
+        } else {
+            let (start, end) = ((cursor + 1) as usize, (cursor + length as u64 + 1) as usize);
+            parts.push(String::from_utf8(reader.get_ref()[start..end].to_vec())?);
+            cursor += length as u64 + 1;
+            length = reader.get_ref()[cursor as usize];
+        }
+    }
+
+    cursor += 1;
+    reader.set_position(cursor);
+    Ok(parts.join("."))
+}
+
+fn decord_compressed_name<const SIZE: usize>(reader: &mut Cursor<&[u8; SIZE]>) -> Result<String> {
+    let curr_pos = reader.position() as usize;
+    let curr = reader.get_ref()[curr_pos] & 0b0011_1111;
+    let next = reader.get_ref()[curr_pos + 1];
+    let cursor = u16::from_be_bytes([curr, next]);
+    reader.set_position(cursor as u64);
+    decord_name(reader)
 }
 
 fn build_query(domain_name: &str, record_type: RecordType) -> Result<Vec<u8>> {
@@ -142,9 +200,89 @@ pub enum Class {
     In = 1,
 }
 
+#[derive(Debug)]
+pub struct DnsRecord {
+    name: Vec<u8>,
+    kind: RecordType,
+    class: Class,
+    ttl: u32,
+    data: Vec<u8>,
+}
+
+impl<const SIZE: usize> TryFrom<(Vec<u8>, &mut Cursor<&[u8; SIZE]>)> for DnsRecord {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        (name, reader): (Vec<u8>, &mut Cursor<&[u8; SIZE]>),
+    ) -> std::result::Result<Self, Self::Error> {
+        let data = &mut [0; consts::RECORD_DATA_SIZE];
+        reader.read_exact(data)?;
+
+        let kind = extract_bytes!(data, 0..2, u16);
+        let class = extract_bytes!(data, 2..4, u16);
+        let ttl = extract_bytes!(data, 4..8, u32);
+        let data_len = extract_bytes!(data, 8..10, u16);
+
+        let mut data = vec![0; data_len as usize];
+        let _ = reader.read_exact(&mut data);
+
+        Ok(DnsRecord {
+            name,
+            kind: RecordType::try_from(kind)?,
+            class: Class::try_from(class)?,
+            ttl,
+            data,
+        })
+    }
+}
+
+fn parse_record<const SIZE: usize>(reader: &mut Cursor<&[u8; SIZE]>) -> Result<DnsRecord> {
+    let name = decord_name(reader)?;
+    DnsRecord::try_from((name.into(), reader))
+}
+
+#[derive(Debug)]
+struct DnsPacket {
+    pub header: DnsHeader,
+    pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsRecord>,
+    pub authorities: Vec<DnsRecord>,
+    pub additional: Vec<DnsRecord>,
+}
+
+fn parse_dns_packet<const SIZE: usize>(data: &[u8; SIZE]) -> Result<DnsPacket> {
+    let mut reader = Cursor::new(data);
+
+    let header = parse_header(&mut reader)?;
+    let questions = (0..header.num_questions)
+        .map(|_| parse_question(&mut reader))
+        .collect::<Result<Vec<_>>>()?;
+    let answers = (0..header.num_answers)
+        .map(|_| parse_record(&mut reader))
+        .collect::<Result<Vec<_>>>()?;
+    let authorities = (0..header.num_authorities)
+        .map(|_| parse_record(&mut reader))
+        .collect::<Result<Vec<_>>>()?;
+    let additional = (0..header.num_additional)
+        .map(|_| parse_record(&mut reader))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(DnsPacket {
+        header,
+        questions,
+        answers,
+        authorities,
+        additional,
+    })
+}
+
 #[cfg(test)]
 mod test {
-    use super::{build_query, encode_dns_name, header_to_bytes, DnsHeader, RecordType};
+    use std::net::{Ipv4Addr, UdpSocket};
+
+    use crate::libs::parse_dns_packet;
+
+    use super::{build_query, consts, encode_dns_name, header_to_bytes, DnsHeader, RecordType};
 
     #[test]
     fn test_header() {
@@ -171,5 +309,27 @@ mod test {
     fn test_build_query() {
         let q = build_query("www.example.com", RecordType::A).unwrap();
         println!("Build Query -> {:02x?}", q)
+    }
+
+    #[test]
+    fn send_udp_request_to_google_dns_resolver() {
+        let query = build_query("www.example.com", RecordType::A).unwrap();
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        socket.send_to(&query, ("8.8.8.8", 53)).unwrap();
+
+        let mut response = [0; consts::DNS_BUF_SIZE];
+        let (_, _) = socket.recv_from(&mut response).unwrap();
+
+        println!("Response -> {:x?}", &response);
+
+        let r = parse_dns_packet(&response);
+        println!("Parsed response -> {:?}", r);
+
+        let data = &r.unwrap().answers[0].data;
+        assert_eq!(data.len(), 4);
+        assert_eq!(data[0], 93);
+        assert_eq!(data[1], 184);
+        assert_eq!(data[2], 216);
+        assert_eq!(data[3], 34);
     }
 }
