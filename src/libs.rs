@@ -278,7 +278,10 @@ fn parse_dns_packet<const SIZE: usize>(data: &[u8; SIZE]) -> Result<DnsPacket> {
 
 #[cfg(test)]
 mod test {
-    use std::net::{Ipv4Addr, UdpSocket};
+    use std::{
+        io::Cursor,
+        net::{Ipv4Addr, UdpSocket},
+    };
 
     use crate::libs::parse_dns_packet;
 
@@ -331,5 +334,32 @@ mod test {
         assert_eq!(data[1], 184);
         assert_eq!(data[2], 216);
         assert_eq!(data[3], 34);
+    }
+
+    #[test]
+    fn test_decode_name() {
+        let mut buf = [0; consts::DNS_BUF_SIZE];
+        buf[0] = 3;
+        buf[1] = 'w' as u8;
+        buf[2] = 'w' as u8;
+        buf[3] = 'w' as u8;
+        buf[4] = 7;
+        buf[5] = 'e' as u8;
+        buf[6] = 'x' as u8;
+        buf[7] = 'a' as u8;
+        buf[8] = 'm' as u8;
+        buf[9] = 'p' as u8;
+        buf[10] = 'l' as u8;
+        buf[11] = 'e' as u8;
+        buf[12] = 3;
+        buf[13] = 'c' as u8;
+        buf[14] = 'o' as u8;
+        buf[15] = 'm' as u8;
+        buf[16] = 0;
+
+        let mut cur = Cursor::new(&buf);
+        let name = super::decord_name(&mut cur);
+        assert_eq!(name.unwrap(), "www.example.com");
+        assert_eq!(cur.position(), 17);
     }
 }
