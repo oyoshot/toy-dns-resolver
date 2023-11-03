@@ -1,4 +1,7 @@
-use std::io::{Cursor, Read};
+use std::{
+    io::{Cursor, Read},
+    net::{Ipv4Addr, UdpSocket},
+};
 
 use anyhow::{Ok, Result};
 use num_enum::TryFromPrimitive;
@@ -20,6 +23,21 @@ mod consts {
     pub const HEADER_SIZE: usize = 12;
     pub const QUESTION_DATA_SIZE: usize = 4;
     pub const RECORD_DATA_SIZE: usize = 10;
+}
+
+pub fn lookup_domain(domain_name: &str) -> Result<Ipv4Addr> {
+    let query = build_query(domain_name, RecordType::A)?;
+
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    socket.send_to(&query, ("8.8.8.8", 53)).unwrap();
+
+    let mut response = [0; consts::DNS_BUF_SIZE];
+    let (_, _) = socket.recv_from(&mut response).unwrap();
+
+    let packet = parse_dns_packet(&response)?;
+    let [octet1, octet2,octet3,octet4,..] = packet.answers[0].data[0..4] else { return Err(anyhow::anyhow!("data is not correct format."));};
+
+    Ok(Ipv4Addr::new(octet1, octet2, octet3, octet4))
 }
 
 trait ToBytes {
